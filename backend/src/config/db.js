@@ -29,19 +29,24 @@ let connectingPromise;
 // CONNECT TO MONGODB
 // ========================================
 
+
 async function connect() {
   if (database) return database;
 
-  // Prevent multiple simultaneous connections
   if (connectingPromise) return connectingPromise;
 
   connectingPromise = (async () => {
-    const uri = process.env.MONGODB_URI;
-    const dbName = process.env.MONGODB_DB || 'hostel_management';
+    const uri = process.env.MONGODB_URI?.trim();
+    const dbName = process.env.MONGODB_DB?.trim() || 'hostel_management';
 
     if (!uri) {
+      throw new Error('MONGODB_URI is missing');
+    }
+
+    // Validate MongoDB URI format
+    if (!/^mongodb(\+srv)?:\/\//i.test(uri)) {
       throw new Error(
-        'MONGODB_URI is missing. Configure it in Render Environment Variables.'
+        'Invalid MONGODB_URI. It must start with mongodb:// or mongodb+srv://'
       );
     }
 
@@ -56,18 +61,14 @@ async function connect() {
 
       database = client.db(dbName);
 
-      // Verify database connectivity
       await database.command({ ping: 1 });
 
-      console.log('================================');
       console.log('MongoDB connected successfully!');
       console.log('Database:', dbName);
-      console.log('================================');
 
-      // Create required indexes
       await ensureIndexes(database);
 
-      console.log('MongoDB indexes initialized successfully');
+      console.log('MongoDB indexes initialized successfully!');
 
       return database;
 
@@ -93,6 +94,7 @@ async function connect() {
 
   return connectingPromise;
 }
+
 
 // ========================================
 // GET DATABASE INSTANCE
