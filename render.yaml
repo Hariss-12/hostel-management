@@ -1,9 +1,5 @@
-# Render Blueprint - New > Blueprint > pick this repo.
+# Render Blueprint - MongoDB Atlas is configured separately as a private service variable.
 # Deploys are triggered by .github/workflows/deploy.yml (autoDeploy is off).
-databases:
-  - name: hms-db
-    databaseName: hostel_management
-    plan: free
 
 services:
   # ---------- Backend API ----------
@@ -19,10 +15,10 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20
-      - key: DATABASE_URL
-        fromDatabase:
-          name: hms-db
-          property: connectionString
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: hostel_management
       - key: JWT_SECRET
         generateValue: true
       - key: JWT_EXPIRES_IN
@@ -44,7 +40,7 @@ services:
         value: 20
       # Set to your backend URL + /api, e.g. https://hms-backend.onrender.com/api
       - key: VITE_API_URL
-        sync: false
+        value: https://hostel-management-qr6f.onrender.com/api
     routes:
       # React Router: send every path to index.html
       - type: rewrite

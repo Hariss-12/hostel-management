@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const bcrypt = require('bcrypt');
-const { query, withTransaction } = require('../config/db');
+const { collection, insert, withTransaction, isDuplicate } = require('../config/db');
 const { authenticate, authorize } = require('../middleware/auth');
 const { assertValid } = require('../middleware/validate');
 const { idParam } = require('../middleware/params');
@@ -9,148 +9,129 @@ const HttpError = require('../utils/httpError');
 
 router.use(authenticate);
 router.param('id', idParam);
-
-const STUDENT_SELECT = `
-  SELECT s.id, s.user_id, u.name, u.email, u.phone, s.roll_number, s.course, s.year_of_study, s.gender,
-         s.date_of_birth, s.blood_group, s.guardian_name, s.guardian_phone, s.address, s.admission_date, s.status,
-         h.id AS hostel_id, h.name AS hostel_name, r.room_number, b.bed_number
-    FROM students s
-    JOIN users u ON u.id = s.user_id
-    LEFT JOIN allocations a ON a.student_id = s.id AND a.status = 'active'
-    LEFT JOIN beds b ON b.id = a.bed_id
-    LEFT JOIN rooms r ON r.id = b.room_id
-    LEFT JOIN hostels h ON h.id = r.hostel_id`;
-
-const fetchStudent = async (id) => (await query(`${STUDENT_SELECT} WHERE s.id = $1`, [id])).rows[0];
-
 const profileRules = {
-  phone: { type: 'phone' },
-  date_of_birth: { type: 'date', label: 'date of birth' },
+  phone: { type: 'phone' }, date_of_birth: { type: 'date', label: 'date of birth' },
   blood_group: { oneOf: ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'], label: 'blood group' },
-  guardian_name: { maxLength: 100, label: "the guardian's name" },
-  guardian_phone: { type: 'phone', label: "the guardian's phone" },
+  guardian_name: { maxLength: 100, label: "the guardian's name" }, guardian_phone: { type: 'phone', label: "the guardian's phone" },
   address: { maxLength: 255 },
 };
-
 const staffRules = {
-  ...profileRules,
-  name: { required: true, minLength: 2, maxLength: 100 },
-  email: { required: true, type: 'email', maxLength: 150 },
-  roll_number: { required: true, maxLength: 30, label: 'the roll number' },
-  course: { required: true, maxLength: 100 },
-  year_of_study: { required: true, type: 'int', min: 1, max: 4, label: 'the year of study' },
-  gender: { required: true, oneOf: ['male', 'female', 'other'] },
-  admission_date: { type: 'date', label: 'admission date' },
+  ...profileRules, name: { required: true, minLength: 2, maxLength: 100 },
+  email: { required: true, type: 'email', maxLength: 150 }, roll_number: { required: true, maxLength: 30, label: 'the roll number' },
+  course: { required: true, maxLength: 100 }, year_of_study: { required: true, type: 'int', min: 1, max: 4, label: 'the year of study' },
+  gender: { required: true, oneOf: ['male', 'female', 'other'] }, admission_date: { type: 'date', label: 'admission date' },
 };
-
 const conflict = (field, message) => new HttpError(409, message, { [field]: message });
 
-router.get(
-  '/',
-  authorize('admin', 'warden'),
-  asyncHandler(async (req, res) => {
-    const { rows } = await query(`${STUDENT_SELECT} ORDER BY u.name`);
-    res.json(rows);
-  })
-);
+async function getStudent(id) {
+  const rows = await collection('students').aggregate([
+    { $match: { id: Number(id) } },
+    { $lookup: { from: 'users', localField: 'user_id', foreignField: 'id', as: 'user' } },
+    { $unwind: '$user' },
+    { $lookup: { from: 'allocations', let: { sid: '$id' }, pipeline: [
+      { $match: { $expr: { $and: [{ $eq: ['$student_id', '$$sid'] }, { $eq: ['$status', 'active'] }] } } },
+      { $limit: 1 }, { $lookup: { from: 'beds', localField: 'bed_id', foreignField: 'id', as: 'bed' } }, { $unwind: { path: '$bed', preserveNullAndEmptyArrays: true } },
+      { $lookup: { from: 'rooms', localField: 'bed.room_id', foreignField: 'id', as: 'room' } }, { $unwind: { path: '$room', preserveNullAndEmptyArrays: true } },
+      { $lookup: { from: 'hostels', localField: 'room.hostel_id', foreignField: 'id', as: 'hostel' } }, { $unwind: { path: '$hostel', preserveNullAndEmptyArrays: true } },
+    ], as: 'allocation' } },
+    { $unwind: { path: '$allocation', preserveNullAndEmptyArrays: true } },
+    { $project: {
+      _id: 0, id: 1, user_id: 1, name: '$user.name', email: '$user.email', phone: '$user.phone',
+      roll_number: 1, course: 1, year_of_study: 1, gender: 1, date_of_birth: 1, blood_group: 1,
+      guardian_name: 1, guardian_phone: 1, address: 1, admission_date: 1, status: 1,
+      hostel_id: { $ifNull: ['$allocation.hostel.id', null] }, hostel_name: { $ifNull: ['$allocation.hostel.name', null] },
+      room_number: { $ifNull: ['$allocation.room.room_number', null] }, bed_number: { $ifNull: ['$allocation.bed.bed_number', null] },
+    } },
+  ]).toArray();
+  return rows[0];
+}
 
-router.get(
-  '/:id',
-  asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const isStaff = ['admin', 'warden'].includes(req.user.role);
-    if (!isStaff && req.user.student_id !== id) throw new HttpError(403, 'You can only view your own profile');
-    const student = await fetchStudent(id);
-    if (!student) throw new HttpError(404, 'Student not found');
-    res.json(student);
-  })
-);
-
-router.post(
-  '/',
-  authorize('admin', 'warden'),
-  asyncHandler(async (req, res) => {
-    assertValid({ ...staffRules, password: { required: true, minLength: 6, maxLength: 72, label: 'a temporary password' } }, req.body);
-    const b = req.body;
-    const email = b.email.toLowerCase();
-
-    const id = await withTransaction(async (c) => {
-      if ((await c.query('SELECT 1 FROM users WHERE email = $1', [email])).rowCount) throw conflict('email', 'Email is already registered');
-      if ((await c.query('SELECT 1 FROM students WHERE LOWER(roll_number) = LOWER($1)', [b.roll_number])).rowCount) {
-        throw conflict('roll_number', 'Roll number already exists');
-      }
-      const hash = await bcrypt.hash(b.password, 10);
-      const u = await c.query(
-        `INSERT INTO users (name, email, password_hash, role, phone) VALUES ($1, $2, $3, 'student', $4) RETURNING id`,
-        [b.name, email, hash, b.phone]
-      );
-      const s = await c.query(
-        `INSERT INTO students (user_id, roll_number, course, year_of_study, gender, date_of_birth, blood_group,
-                               guardian_name, guardian_phone, address, admission_date)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::date, CURRENT_DATE)) RETURNING id`,
-        [u.rows[0].id, b.roll_number, b.course, b.year_of_study, b.gender, b.date_of_birth, b.blood_group,
-         b.guardian_name, b.guardian_phone, b.address, b.admission_date]
-      );
-      return s.rows[0].id;
+router.get('/', authorize('admin', 'warden'), asyncHandler(async (_req, res) => {
+  const students = await collection('students').find().toArray();
+  const names = await Promise.all(students.map(async (s) => ({ id: s.id, name: (await collection('users').findOne({ id: s.user_id }))?.name || '' })));
+  names.sort((a, b) => a.name.localeCompare(b.name));
+  const rows = await Promise.all(names.map((s) => getStudent(s.id)));
+  res.json(rows);
+}));
+router.get('/:id', asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!['admin', 'warden'].includes(req.user.role) && req.user.student_id !== id) throw new HttpError(403, 'You can only view your own profile');
+  const student = await getStudent(id);
+  if (!student) throw new HttpError(404, 'Student not found');
+  res.json(student);
+}));
+router.post('/', authorize('admin', 'warden'), asyncHandler(async (req, res) => {
+  assertValid({ ...staffRules, password: { required: true, minLength: 6, maxLength: 72, label: 'a temporary password' } }, req.body);
+  const b = req.body; const email = b.email.toLowerCase();
+  try {
+    const id = await withTransaction(async (session) => {
+      if (await collection('users').findOne({ email })) throw conflict('email', 'Email is already registered');
+      if (await collection('students').findOne({ roll_number_lc: b.roll_number.toLowerCase() })) throw conflict('roll_number', 'Roll number already exists');
+      const u = await insert('users', { name: b.name, email, password_hash: await bcrypt.hash(b.password, 10), role: 'student', phone: b.phone, is_active: true, created_at: new Date() }, session);
+      const s = await insert('students', {
+        user_id: u.id, roll_number: b.roll_number, roll_number_lc: b.roll_number.toLowerCase(), course: b.course,
+        year_of_study: Number(b.year_of_study), gender: b.gender, date_of_birth: b.date_of_birth || null,
+        blood_group: b.blood_group || null, guardian_name: b.guardian_name || null, guardian_phone: b.guardian_phone || null,
+        address: b.address || null, admission_date: b.admission_date || new Date().toISOString().slice(0, 10), status: 'active',
+      }, session);
+      return s.id;
     });
-    res.status(201).json(await fetchStudent(id));
-  })
-);
-
-router.put(
-  '/:id',
-  asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const isStaff = ['admin', 'warden'].includes(req.user.role);
-    if (!isStaff && req.user.student_id !== id) throw new HttpError(403, 'You can only edit your own profile');
-    const existing = await fetchStudent(id);
-    if (!existing) throw new HttpError(404, 'Student not found');
-    const b = req.body;
-
-    await withTransaction(async (c) => {
+    res.status(201).json(await getStudent(id));
+  } catch (err) {
+    if (isDuplicate(err)) throw new HttpError(409, 'Email or roll number already exists');
+    throw err;
+  }
+}));
+router.put('/:id', asyncHandler(async (req, res) => {
+  const id = Number(req.params.id); const isStaff = ['admin', 'warden'].includes(req.user.role);
+  if (!isStaff && req.user.student_id !== id) throw new HttpError(403, 'You can only edit your own profile');
+  const existing = await collection('students').findOne({ id });
+  if (!existing) throw new HttpError(404, 'Student not found');
+  const b = req.body; const user = await collection('users').findOne({ id: existing.user_id });
+  try {
+    await withTransaction(async (session) => {
       if (isStaff) {
         assertValid({ ...staffRules, status: { required: true, oneOf: ['active', 'inactive', 'alumni'] }, password: { minLength: 6, maxLength: 72 } }, b);
         const email = b.email.toLowerCase();
-        if ((await c.query('SELECT 1 FROM users WHERE email = $1 AND id <> $2', [email, existing.user_id])).rowCount) throw conflict('email', 'Email is already registered');
-        if ((await c.query('SELECT 1 FROM students WHERE LOWER(roll_number) = LOWER($1) AND id <> $2', [b.roll_number, id])).rowCount) {
-          throw conflict('roll_number', 'Roll number already exists');
-        }
-        // Inactive / alumni students can no longer sign in
-        await c.query('UPDATE users SET name = $1, email = $2, phone = $3, is_active = $4 WHERE id = $5',
-          [b.name, email, b.phone, b.status === 'active', existing.user_id]);
-        if (b.password) await c.query('UPDATE users SET password_hash = $1 WHERE id = $2', [await bcrypt.hash(b.password, 10), existing.user_id]);
-        await c.query(
-          `UPDATE students SET roll_number = $1, course = $2, year_of_study = $3, gender = $4, date_of_birth = $5,
-                  blood_group = $6, guardian_name = $7, guardian_phone = $8, address = $9,
-                  admission_date = COALESCE($10::date, admission_date), status = $11
-            WHERE id = $12`,
-          [b.roll_number, b.course, b.year_of_study, b.gender, b.date_of_birth, b.blood_group,
-           b.guardian_name, b.guardian_phone, b.address, b.admission_date, b.status, id]
-        );
+        if (await collection('users').findOne({ email, id: { $ne: user.id } })) throw conflict('email', 'Email is already registered');
+        if (await collection('students').findOne({ roll_number_lc: b.roll_number.toLowerCase(), id: { $ne: id } })) throw conflict('roll_number', 'Roll number already exists');
+        const userSet = { name: b.name, email, phone: b.phone, is_active: b.status === 'active' };
+        if (b.password) userSet.password_hash = await bcrypt.hash(b.password, 10);
+        await collection('users').updateOne({ id: user.id }, { $set: userSet }, { session });
+        await collection('students').updateOne({ id }, { $set: {
+          roll_number: b.roll_number, roll_number_lc: b.roll_number.toLowerCase(), course: b.course,
+          year_of_study: Number(b.year_of_study), gender: b.gender, date_of_birth: b.date_of_birth || null,
+          blood_group: b.blood_group || null, guardian_name: b.guardian_name || null, guardian_phone: b.guardian_phone || null,
+          address: b.address || null, admission_date: b.admission_date || existing.admission_date, status: b.status,
+        } }, { session });
       } else {
-        // Students may only change their contact details
         assertValid(profileRules, b);
-        await c.query('UPDATE users SET phone = $1 WHERE id = $2', [b.phone, existing.user_id]);
-        await c.query(
-          `UPDATE students SET date_of_birth = $1, blood_group = $2, guardian_name = $3, guardian_phone = $4, address = $5 WHERE id = $6`,
-          [b.date_of_birth, b.blood_group, b.guardian_name, b.guardian_phone, b.address, id]
-        );
+        await collection('users').updateOne({ id: user.id }, { $set: { phone: b.phone } }, { session });
+        await collection('students').updateOne({ id }, { $set: {
+          date_of_birth: b.date_of_birth || null, blood_group: b.blood_group || null, guardian_name: b.guardian_name || null,
+          guardian_phone: b.guardian_phone || null, address: b.address || null,
+        } }, { session });
       }
     });
-    res.json(await fetchStudent(id));
-  })
-);
-
-// Permanently removes the student and every record that belongs to them (admin only).
-router.delete(
-  '/:id',
-  authorize('admin'),
-  asyncHandler(async (req, res) => {
-    const student = await fetchStudent(Number(req.params.id));
-    if (!student) throw new HttpError(404, 'Student not found');
-    await query('DELETE FROM users WHERE id = $1', [student.user_id]);
-    res.json({ message: 'Student deleted' });
-  })
-);
-
+    res.json(await getStudent(id));
+  } catch (err) {
+    if (isDuplicate(err)) throw new HttpError(409, 'Email or roll number already exists');
+    throw err;
+  }
+}));
+router.delete('/:id', authorize('admin'), asyncHandler(async (req, res) => {
+  const student = await collection('students').findOne({ id: Number(req.params.id) });
+  if (!student) throw new HttpError(404, 'Student not found');
+  await withTransaction(async (session) => {
+    const fees = await collection('fees').find({ student_id: student.id }, { session }).project({ id: 1 }).toArray();
+    await collection('payments').deleteMany({ fee_id: { $in: fees.map((f) => f.id) } }, { session });
+    for (const name of ['students', 'allocations', 'fees', 'attendance', 'leaves', 'meal_opt_outs', 'complaints']) {
+      const field = name === 'students' ? 'id' : 'student_id';
+      await collection(name).deleteMany({ [field]: name === 'students' ? student.id : student.id }, { session });
+    }
+    await collection('notifications').deleteMany({ user_id: student.user_id }, { session });
+    await collection('users').deleteOne({ id: student.user_id }, { session });
+  });
+  res.json({ message: 'Student deleted' });
+}));
 module.exports = router;

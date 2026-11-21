@@ -1,33 +1,24 @@
-// Creates the first admin account using ADMIN_* values from backend/.env
-// Run it yourself once after applying schema.sql:  npm run create-admin
+// Creates the first administrator from ADMIN_* environment variables.
 require('dotenv').config();
 const bcrypt = require('bcrypt');
-const { pool } = require('../src/config/db');
-
+const { connect, collection, insert, client, isDuplicate } = require('../src/config/db');
 (async () => {
   const name = process.env.ADMIN_NAME || 'Hostel Admin';
   const email = (process.env.ADMIN_EMAIL || '').toLowerCase();
   const password = process.env.ADMIN_PASSWORD || '';
-  if (!email || password.length < 6) {
-    console.error('Set ADMIN_EMAIL and an ADMIN_PASSWORD (min 6 characters) in backend/.env first.');
-    process.exit(1);
+  if (!email || password.length < 6 || password.length > 72) {
+    console.error('Set ADMIN_EMAIL and an ADMIN_PASSWORD (6-72 characters) in backend/.env first.');
+    process.exitCode = 1; return;
   }
   try {
-    const exists = await pool.query('SELECT 1 FROM users WHERE email = $1', [email]);
-    if (exists.rowCount) {
-      console.log(`A user with ${email} already exists. Nothing changed.`);
-    } else {
-      const hash = await bcrypt.hash(password, 10);
-      await pool.query(
-        `INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, 'admin')`,
-        [name, email, hash]
-      );
-      console.log(`Admin created. Sign in with ${email}`);
+    await connect();
+    if (await collection('users').findOne({ email })) console.log('An account with the configured email already exists. Nothing changed.');
+    else {
+      await insert('users', { name, email, password_hash: await bcrypt.hash(password, 10), role: 'admin', is_active: true, created_at: new Date() });
+      console.log('Administrator account created.');
     }
   } catch (err) {
-    console.error('Could not create admin:', err.message);
+    console.error('Could not create admin:', isDuplicate(err) ? 'Email is already registered.' : err.message);
     process.exitCode = 1;
-  } finally {
-    await pool.end();
-  }
+  } finally { if (client()) await client().close(); }
 })();

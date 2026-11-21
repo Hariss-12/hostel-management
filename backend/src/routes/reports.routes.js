@@ -1,90 +1,59 @@
 const router = require('express').Router();
-const { query } = require('../config/db');
+const { collection } = require('../config/db');
 const { authenticate, authorize } = require('../middleware/auth');
 const { optInt, isDate, isMonth, today } = require('../utils/helpers');
 const asyncHandler = require('../utils/asyncHandler');
 const HttpError = require('../utils/httpError');
-
 router.use(authenticate, authorize('admin', 'warden'));
-
-const dateOrNull = (v) => (isDate(v) ? v : null);
-
+const dateOrNull = (v) => isDate(v) ? v : null;
 const reports = {
-  // Beds per room: capacity, occupied, vacant
-  occupancy: async (q) => (await query(
-    `SELECT h.name AS hostel, r.room_number, r.floor, r.room_type,
-            COUNT(b.id) FILTER (WHERE b.is_usable) AS beds,
-            COUNT(a.id) AS occupied,
-            COUNT(b.id) FILTER (WHERE b.is_usable) - COUNT(a.id) AS vacant
-       FROM rooms r JOIN hostels h ON h.id = r.hostel_id
-       LEFT JOIN beds b ON b.room_id = r.id
-       LEFT JOIN allocations a ON a.bed_id = b.id AND a.status = 'active'
-      WHERE ($1::int IS NULL OR h.id = $1)
-      GROUP BY h.name, r.id, r.room_number, r.floor, r.room_type
-      ORDER BY h.name, r.floor, r.room_number`,
-    [optInt(q.hostel_id)])).rows,
-
-  // Billed / paid / balance per student, optionally within a due-date range
-  fees: async (q) => (await query(
-    `SELECT u.name AS student, s.roll_number, h.name AS hostel,
-            COALESCE(SUM(f.amount), 0) AS billed,
-            COALESCE(SUM(pp.paid), 0) AS paid,
-            COALESCE(SUM(f.amount), 0) - COALESCE(SUM(pp.paid), 0) AS balance
-       FROM students s
-       JOIN users u ON u.id = s.user_id
-       LEFT JOIN allocations a ON a.student_id = s.id AND a.status = 'active'
-       LEFT JOIN beds b ON b.id = a.bed_id
-       LEFT JOIN rooms r ON r.id = b.room_id
-       LEFT JOIN hostels h ON h.id = r.hostel_id
-       JOIN fees f ON f.student_id = s.id
-            AND ($2::date IS NULL OR f.due_date >= $2::date) AND ($3::date IS NULL OR f.due_date <= $3::date)
-       LEFT JOIN (SELECT fee_id, SUM(amount) AS paid FROM payments GROUP BY fee_id) pp ON pp.fee_id = f.id
-      WHERE ($1::int IS NULL OR h.id = $1)
-      GROUP BY s.id, u.name, s.roll_number, h.name
-      ORDER BY balance DESC, u.name`,
-    [optInt(q.hostel_id), dateOrNull(q.from), dateOrNull(q.to)])).rows,
-
-  // Monthly attendance per student
-  attendance: async (q) => {
-    const month = isMonth(q.month) ? q.month : today().slice(0, 7);
-    const { rows } = await query(
-      `SELECT u.name AS student, s.roll_number, h.name AS hostel,
-              COUNT(at.id) FILTER (WHERE at.status = 'present') AS present,
-              COUNT(at.id) FILTER (WHERE at.status = 'late') AS late,
-              COUNT(at.id) FILTER (WHERE at.status = 'absent') AS absent,
-              COUNT(at.id) FILTER (WHERE at.status = 'on_leave') AS on_leave
-         FROM students s
-         JOIN users u ON u.id = s.user_id
-         JOIN allocations a ON a.student_id = s.id AND a.status = 'active'
-         JOIN beds b ON b.id = a.bed_id JOIN rooms r ON r.id = b.room_id JOIN hostels h ON h.id = r.hostel_id
-         LEFT JOIN attendance at ON at.student_id = s.id
-              AND at.attendance_date >= $1::date AND at.attendance_date < ($1::date + INTERVAL '1 month')
-        WHERE s.status = 'active' AND ($2::int IS NULL OR h.id = $2)
-        GROUP BY s.id, u.name, s.roll_number, h.name ORDER BY u.name`,
-      [`${month}-01`, optInt(q.hostel_id)]
-    );
-    return rows.map((r) => {
-      const counted = r.present + r.late + r.absent;
-      return { ...r, percentage: counted ? Math.round(((r.present + r.late) / counted) * 100) : null };
-    });
+  occupancy: async (q) => {
+    const hostelId = optInt(q.hostel_id); const result = [];
+    for (const r of await collection('rooms').find(hostelId ? { hostel_id: hostelId } : {}).toArray()) {
+      const h = await collection('hostels').findOne({ id: r.hostel_id }); const beds = await collection('beds').find({ room_id: r.id }).toArray();
+      const usable = beds.filter((b) => b.is_usable); const occupied = await collection('allocations').countDocuments({ bed_id: { $in: usable.map((b) => b.id) }, status: 'active' });
+      result.push({ hostel: h.name, room_number: r.room_number, floor: r.floor, room_type: r.room_type, beds: usable.length, occupied, vacant: usable.length - occupied });
+    }
+    return result.sort((a, b) => a.hostel.localeCompare(b.hostel) || a.floor - b.floor || a.room_number.localeCompare(b.room_number));
   },
-
-  // Complaints raised within a date range
-  complaints: async (q) => (await query(
-    `SELECT c.id, c.created_at::date AS raised_on, c.category, c.title, c.priority, c.status,
-            u.name AS student, COALESCE(mu.name, '') AS assigned_to,
-            CASE WHEN c.resolved_at IS NULL THEN NULL ELSE (c.resolved_at::date - c.created_at::date) END AS days_to_resolve
-       FROM complaints c JOIN students s ON s.id = c.student_id JOIN users u ON u.id = s.user_id
-       LEFT JOIN users mu ON mu.id = c.assigned_to
-      WHERE ($1::date IS NULL OR c.created_at::date >= $1::date) AND ($2::date IS NULL OR c.created_at::date <= $2::date)
-      ORDER BY c.created_at DESC`,
-    [dateOrNull(q.from), dateOrNull(q.to)])).rows,
+  fees: async (q) => {
+    const from = dateOrNull(q.from); const to = dateOrNull(q.to); const hostelId = optInt(q.hostel_id); const groups = new Map();
+    for (const f of await collection('fees').find({ ...(from || to ? { due_date: { ...(from ? { $gte: from } : {}), ...(to ? { $lte: to } : {}) } } : {}) }).toArray()) {
+      const s = await collection('students').findOne({ id: f.student_id }); const u = s && await collection('users').findOne({ id: s.user_id });
+      const a = await collection('allocations').findOne({ student_id: s.id, status: 'active' }); const bed = a && await collection('beds').findOne({ id: a.bed_id }); const room = bed && await collection('rooms').findOne({ id: bed.room_id }); const h = room && await collection('hostels').findOne({ id: room.hostel_id });
+      if (hostelId && (!h || h.id !== hostelId)) continue;
+      const key = `${s.id}:${h ? h.id : ''}`; const row = groups.get(key) || { student: u.name, roll_number: s.roll_number, hostel: h ? h.name : null, billed: 0, paid: 0, balance: 0 };
+      row.billed += f.amount; row.paid += await collection('payments').aggregate([{ $match: { fee_id: f.id } }, { $group: { _id: null, sum: { $sum: '$amount' } } }]).toArray().then((x) => x[0]?.sum || 0);
+      row.balance = row.billed - row.paid; groups.set(key, row);
+    }
+    return [...groups.values()].sort((a, b) => b.balance - a.balance || a.student.localeCompare(b.student));
+  },
+  attendance: async (q) => {
+    const month = isMonth(q.month) ? q.month : today().slice(0, 7); const hostelId = optInt(q.hostel_id); const result = [];
+    for (const s of await collection('students').find({ status: 'active' }).toArray()) {
+      const a = await collection('allocations').findOne({ student_id: s.id, status: 'active' }); if (!a) continue;
+      const bed = await collection('beds').findOne({ id: a.bed_id }); const room = await collection('rooms').findOne({ id: bed.room_id }); const h = await collection('hostels').findOne({ id: room.hostel_id });
+      if (hostelId && h.id !== hostelId) continue;
+      const u = await collection('users').findOne({ id: s.user_id }); const marks = await collection('attendance').find({ student_id: s.id, attendance_date: { $gte: `${month}-01`, $lt: `${month}-32` } }).toArray();
+      const row = { student: u.name, roll_number: s.roll_number, hostel: h.name, present: 0, late: 0, absent: 0, on_leave: 0 };
+      for (const m of marks) row[m.status] += 1;
+      const counted = row.present + row.late + row.absent; row.percentage = counted ? Math.round(((row.present + row.late) / counted) * 100) : null; result.push(row);
+    }
+    return result.sort((a, b) => a.student.localeCompare(b.student));
+  },
+  complaints: async (q) => {
+    const from = dateOrNull(q.from); const to = dateOrNull(q.to); const rows = [];
+    for (const c of await collection('complaints').find().toArray()) {
+      const raised = new Date(c.created_at).toISOString().slice(0, 10); if ((from && raised < from) || (to && raised > to)) continue;
+      const s = await collection('students').findOne({ id: c.student_id }); const u = s && await collection('users').findOne({ id: s.user_id }); const assignee = c.assigned_to && await collection('users').findOne({ id: c.assigned_to });
+      const resolved = c.resolved_at ? new Date(c.resolved_at) : null; const created = new Date(c.created_at);
+      rows.push({ id: c.id, raised_on: raised, category: c.category, title: c.title, priority: c.priority, status: c.status, student: u.name, assigned_to: assignee ? assignee.name : '', days_to_resolve: resolved ? Math.floor((resolved - created) / 86400000) : null });
+    }
+    return rows.sort((a, b) => b.raised_on.localeCompare(a.raised_on));
+  },
 };
-
 router.get('/:type', asyncHandler(async (req, res) => {
-  const build = reports[req.params.type];
-  if (!build) throw new HttpError(404, 'Unknown report');
+  const build = reports[req.params.type]; if (!build) throw new HttpError(404, 'Unknown report');
   res.json({ type: req.params.type, rows: await build(req.query) });
 }));
-
 module.exports = router;

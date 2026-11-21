@@ -21,8 +21,8 @@ export function AuthProvider({ children }) {
       .finally(() => setLoading(false));
   }, [refresh]);
 
-  const login = async (email, password, role) => {
-    const res = await api.post('/auth/login', { email, password, role });
+  const login = async (identifier, password, role) => {
+    const res = await api.post('/auth/login', { identifier, password, role });
     localStorage.setItem('hms_token', res.data.token);
     setUser(res.data.user);
     return res.data.user;

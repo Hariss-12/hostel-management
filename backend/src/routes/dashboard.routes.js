@@ -1,135 +1,109 @@
-// One endpoint, four shapes: the response depends on the signed-in role.
 const router = require('express').Router();
-const { query } = require('../config/db');
+const { collection } = require('../config/db');
 const { authenticate } = require('../middleware/auth');
-const { MEAL_ORDER_SQL } = require('../utils/helpers');
+const { MEAL_TYPES } = require('../utils/helpers');
+const { today } = require('../utils/helpers');
 const asyncHandler = require('../utils/asyncHandler');
-
 router.use(authenticate);
-
-const one = async (sql, params) => (await query(sql, params)).rows[0];
-
-const occupancy = () =>
-  one(`SELECT (SELECT COUNT(*) FROM beds WHERE is_usable) AS total_beds,
-              (SELECT COUNT(*) FROM allocations WHERE status = 'active') AS occupied_beds`);
-
-const feeTotals = () =>
-  one(`SELECT (SELECT COALESCE(SUM(amount), 0) FROM fees) AS billed,
-              (SELECT COALESCE(SUM(amount), 0) FROM payments) AS collected,
-              (SELECT COALESCE(SUM(amount), 0) FROM payments
-                WHERE date_trunc('month', payment_date::timestamp) = date_trunc('month', CURRENT_DATE::timestamp)) AS collected_this_month,
-              (SELECT COUNT(*) FROM fees f WHERE f.due_date < CURRENT_DATE
-                  AND f.amount > COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.fee_id = f.id), 0)) AS overdue_fees`);
-
-const complaintCounts = async () => {
-  const { rows } = await query('SELECT status, COUNT(*) AS n FROM complaints GROUP BY status');
-  const counts = { open: 0, assigned: 0, in_progress: 0, resolved: 0, closed: 0 };
-  rows.forEach((r) => { counts[r.status] = r.n; });
-  return counts;
+const count = (name, filter = {}) => collection(name).countDocuments(filter);
+const total = async (name, field, filter = {}) => {
+  const rows = await collection(name).aggregate([{ $match: filter }, { $group: { _id: null, total: { $sum: `$${field}` } } }]).toArray();
+  return rows[0] ? rows[0].total : 0;
 };
-
-const RECENT_COMPLAINTS = `
-  SELECT c.id, c.title, c.category, c.priority, c.status, c.location, c.created_at, u.name AS student_name, mu.name AS assigned_to_name
-    FROM complaints c JOIN students s ON s.id = c.student_id JOIN users u ON u.id = s.user_id
-    LEFT JOIN users mu ON mu.id = c.assigned_to`;
-
+async function occupancy() {
+  return { total_beds: await count('beds', { is_usable: true }), occupied_beds: await count('allocations', { status: 'active' }) };
+}
+async function feeTotals() {
+  const billed = await total('fees', 'amount'); const collected = await total('payments', 'amount');
+  const month = today().slice(0, 7);
+  const collected_this_month = await total('payments', 'amount', { payment_date: { $regex: `^${month}` } });
+  let overdue_fees = 0;
+  for (const f of await collection('fees').find({ due_date: { $lt: today() } }).toArray()) {
+    const paid = await total('payments', 'amount', { fee_id: f.id });
+    if (paid < f.amount) overdue_fees += 1;
+  }
+  return { billed, collected, collected_this_month, overdue_fees };
+}
+async function complaintCounts() {
+  const counts = { open: 0, assigned: 0, in_progress: 0, resolved: 0, closed: 0 };
+  for (const row of await collection('complaints').aggregate([{ $group: { _id: '$status', n: { $sum: 1 } } }]).toArray()) counts[row._id] = row.n;
+  return counts;
+}
+async function complaintRows(match, limit) {
+  return collection('complaints').aggregate([
+    { $match: match }, { $lookup: { from: 'students', localField: 'student_id', foreignField: 'id', as: 'student' } }, { $unwind: '$student' },
+    { $lookup: { from: 'users', localField: 'student.user_id', foreignField: 'id', as: 'user' } }, { $unwind: '$user' },
+    { $lookup: { from: 'users', localField: 'assigned_to', foreignField: 'id', as: 'assigned' } }, { $unwind: { path: '$assigned', preserveNullAndEmptyArrays: true } },
+    { $project: { _id: 0, id: 1, title: 1, category: 1, priority: 1, status: 1, location: 1, created_at: 1, student_name: '$user.name', assigned_to_name: '$assigned.name' } },
+    { $sort: { created_at: -1 } }, { $limit: limit },
+  ]).toArray();
+}
 async function adminStats() {
-  const [counts, beds, fees, complaints, pendingLeaves, byHostel, monthly, recent] = await Promise.all([
-    one(`SELECT (SELECT COUNT(*) FROM students WHERE status = 'active') AS students,
-                (SELECT COUNT(*) FROM users WHERE role = 'warden' AND is_active) AS wardens,
-                (SELECT COUNT(*) FROM users WHERE role = 'maintenance' AND is_active) AS maintenance,
-                (SELECT COUNT(*) FROM hostels) AS hostels,
-                (SELECT COUNT(*) FROM rooms) AS rooms`),
-    occupancy(),
-    feeTotals(),
-    complaintCounts(),
-    one(`SELECT COUNT(*) AS n FROM leaves WHERE status = 'pending'`),
-    query(`SELECT h.id, h.name,
-                  (SELECT COUNT(*) FROM beds b JOIN rooms r ON r.id = b.room_id WHERE r.hostel_id = h.id AND b.is_usable) AS beds,
-                  (SELECT COUNT(*) FROM allocations a JOIN beds b ON b.id = a.bed_id JOIN rooms r ON r.id = b.room_id
-                    WHERE r.hostel_id = h.id AND a.status = 'active') AS occupied
-             FROM hostels h ORDER BY h.name`),
-    query(`SELECT to_char(m, 'Mon') AS label, COALESCE(SUM(p.amount), 0) AS total
-             FROM generate_series(date_trunc('month', CURRENT_DATE::timestamp) - INTERVAL '5 months', date_trunc('month', CURRENT_DATE::timestamp), INTERVAL '1 month') m
-             LEFT JOIN payments p ON date_trunc('month', p.payment_date::timestamp) = m
-            GROUP BY m ORDER BY m`),
-    query(`${RECENT_COMPLAINTS} WHERE c.status NOT IN ('resolved', 'closed') ORDER BY c.created_at DESC LIMIT 5`),
+  const [students, wardens, maintenance, hostels, rooms, beds, fees, complaints, pending] = await Promise.all([
+    count('students', { status: 'active' }), count('users', { role: 'warden', is_active: true }),
+    count('users', { role: 'maintenance', is_active: true }), count('hostels'), count('rooms'), occupancy(), feeTotals(), complaintCounts(), count('leaves', { status: 'pending' }),
   ]);
-  return {
-    counts, beds, fees: { ...fees, outstanding: fees.billed - fees.collected }, complaints,
-    pending_leaves: pendingLeaves.n, by_hostel: byHostel.rows, monthly_collections: monthly.rows, recent_complaints: recent.rows,
-  };
+  const byHostel = [];
+  for (const h of await collection('hostels').find().sort({ name: 1 }).toArray()) {
+    const roomsForHostel = await collection('rooms').find({ hostel_id: h.id }).toArray(); const bids = roomsForHostel.map((r) => r.id);
+    const bedRows = await collection('beds').find({ room_id: { $in: bids }, is_usable: true }).toArray();
+    const allocations = await collection('allocations').countDocuments({ bed_id: { $in: bedRows.map((b) => b.id) }, status: 'active' });
+    byHostel.push({ id: h.id, name: h.name, beds: bedRows.length, occupied: allocations });
+  }
+  const months = [];
+  const now = new Date(`${today()}T00:00:00Z`);
+  for (let offset = 5; offset >= 0; offset -= 1) {
+    const monthDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - offset, 1));
+    const key = monthDate.toISOString().slice(0, 7);
+    const amount = await total('payments', 'amount', { payment_date: { $regex: `^${key}` } });
+    months.push({ label: monthDate.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' }), total: amount });
+  }
+  const [recent] = await Promise.all([complaintRows({ status: { $nin: ['resolved', 'closed'] } }, 5)]);
+  return { counts: { students, wardens, maintenance, hostels, rooms }, beds, fees: { ...fees, outstanding: fees.billed - fees.collected }, complaints, pending_leaves: pending, by_hostel: byHostel, monthly_collections: months, recent_complaints: recent };
 }
-
 async function wardenStats() {
-  const [students, beds, fees, complaints, pendingLeaves, attendance, unassigned] = await Promise.all([
-    one(`SELECT COUNT(*) AS n FROM students WHERE status = 'active'`),
-    occupancy(),
-    feeTotals(),
-    complaintCounts(),
-    query(`SELECT l.id, l.from_date, l.to_date, l.destination, u.name AS student_name, s.roll_number
-             FROM leaves l JOIN students s ON s.id = l.student_id JOIN users u ON u.id = s.user_id
-            WHERE l.status = 'pending' ORDER BY l.created_at LIMIT 5`),
-    one(`SELECT COUNT(*) FILTER (WHERE at.status = 'present') AS present,
-                COUNT(*) FILTER (WHERE at.status = 'absent') AS absent,
-                COUNT(*) FILTER (WHERE at.status = 'late') AS late,
-                COUNT(*) FILTER (WHERE at.status = 'on_leave') AS on_leave,
-                (SELECT COUNT(*) FROM students s JOIN allocations a ON a.student_id = s.id AND a.status = 'active' WHERE s.status = 'active') AS total
-           FROM attendance at WHERE at.attendance_date = CURRENT_DATE`),
-    query(`${RECENT_COMPLAINTS} WHERE c.status = 'open' ORDER BY CASE c.priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, c.created_at LIMIT 5`),
+  const [students, beds, fees, complaints, pending] = await Promise.all([
+    count('students', { status: 'active' }), occupancy(), feeTotals(), complaintCounts(),
+    collection('leaves').aggregate([{ $match: { status: 'pending' } }, { $lookup: { from: 'students', localField: 'student_id', foreignField: 'id', as: 'student' } }, { $unwind: '$student' }, { $lookup: { from: 'users', localField: 'student.user_id', foreignField: 'id', as: 'user' } }, { $unwind: '$user' }, { $sort: { created_at: 1 } }, { $limit: 5 }, { $project: { _id: 0, id: 1, from_date: 1, to_date: 1, destination: 1, student_name: '$user.name', roll_number: '$student.roll_number' } }]).toArray(),
   ]);
-  return {
-    students: students.n, beds, fees: { ...fees, outstanding: fees.billed - fees.collected }, complaints,
-    pending_leaves: pendingLeaves.rows, attendance_today: attendance, unassigned_complaints: unassigned.rows,
-  };
+  const marked = await collection('attendance').find({ attendance_date: today() }).toArray();
+  const attendance = { present: 0, absent: 0, late: 0, on_leave: 0, total: 0 };
+  for (const a of marked) if (attendance[a.status] !== undefined) attendance[a.status] += 1;
+  const activeAllocations = await collection('allocations').find({ status: 'active' }).toArray();
+  const hostellerIds = [];
+  for (const a of activeAllocations) if (await collection('students').findOne({ id: a.student_id, status: 'active' })) hostellerIds.push(a.student_id);
+  attendance.total = hostellerIds.length;
+  return { students, beds, fees: { ...fees, outstanding: fees.billed - fees.collected }, complaints, pending_leaves: pending, attendance_today: attendance, unassigned_complaints: await complaintRows({ status: 'open' }, 5) };
 }
-
 async function studentStats(user) {
-  const sid = user.student_id;
-  const [allocation, fee, nextDue, attendance, leaves, complaints, menu] = await Promise.all([
-    one(`SELECT h.name AS hostel_name, r.room_number, r.floor, r.room_type, b.bed_number, a.start_date
-           FROM allocations a JOIN beds b ON b.id = a.bed_id JOIN rooms r ON r.id = b.room_id JOIN hostels h ON h.id = r.hostel_id
-          WHERE a.student_id = $1 AND a.status = 'active'`, [sid]),
-    one(`SELECT COALESCE(SUM(f.amount), 0) AS billed, COALESCE(SUM(p.paid), 0) AS paid
-           FROM fees f LEFT JOIN (SELECT fee_id, SUM(amount) AS paid FROM payments GROUP BY fee_id) p ON p.fee_id = f.id
-          WHERE f.student_id = $1`, [sid]),
-    one(`SELECT f.title, f.due_date, f.amount - COALESCE(p.paid, 0) AS balance
-           FROM fees f LEFT JOIN (SELECT fee_id, SUM(amount) AS paid FROM payments GROUP BY fee_id) p ON p.fee_id = f.id
-          WHERE f.student_id = $1 AND f.amount - COALESCE(p.paid, 0) > 0 ORDER BY f.due_date LIMIT 1`, [sid]),
-    one(`SELECT COUNT(*) FILTER (WHERE status = 'present') AS present, COUNT(*) FILTER (WHERE status = 'late') AS late,
-                COUNT(*) FILTER (WHERE status = 'absent') AS absent
-           FROM attendance WHERE student_id = $1 AND date_trunc('month', attendance_date::timestamp) = date_trunc('month', CURRENT_DATE::timestamp)`, [sid]),
-    one(`SELECT COUNT(*) FILTER (WHERE status = 'pending') AS pending,
-                COUNT(*) FILTER (WHERE status = 'approved' AND to_date >= CURRENT_DATE) AS upcoming
-           FROM leaves WHERE student_id = $1`, [sid]),
-    one(`SELECT COUNT(*) AS n FROM complaints WHERE student_id = $1 AND status NOT IN ('resolved', 'closed')`, [sid]),
-    query(`SELECT meal_type, items FROM mess_menu WHERE day_of_week = EXTRACT(ISODOW FROM CURRENT_DATE)::int ORDER BY ${MEAL_ORDER_SQL}`),
-  ]);
+  const sid = user.student_id; const a = await collection('allocations').findOne({ student_id: sid, status: 'active' });
+  let allocation = null;
+  if (a) {
+    const b = await collection('beds').findOne({ id: a.bed_id }); const r = await collection('rooms').findOne({ id: b.room_id }); const h = await collection('hostels').findOne({ id: r.hostel_id });
+    allocation = { hostel_name: h.name, room_number: r.room_number, floor: r.floor, room_type: r.room_type, bed_number: b.bed_number, start_date: a.start_date };
+  }
+  const feeRows = await collection('fees').find({ student_id: sid }).toArray(); const billed = feeRows.reduce((n, f) => n + f.amount, 0);
+  const paid = await total('payments', 'amount', { fee_id: { $in: feeRows.map((f) => f.id) } });
+  let next_due = null;
+  for (const f of feeRows.sort((x, y) => x.due_date.localeCompare(y.due_date))) {
+    const collected = await total('payments', 'amount', { fee_id: f.id });
+    if (f.amount > collected) { next_due = { title: f.title, due_date: f.due_date, balance: f.amount - collected }; break; }
+  }
+  const thisMonth = today().slice(0, 7); const marks = await collection('attendance').find({ student_id: sid, attendance_date: { $regex: `^${thisMonth}` } }).toArray();
+  const attendance = { present: marks.filter((a) => a.status === 'present').length, late: marks.filter((a) => a.status === 'late').length, absent: marks.filter((a) => a.status === 'absent').length };
   const counted = attendance.present + attendance.late + attendance.absent;
-  return {
-    allocation: allocation || null,
-    fees: { billed: fee.billed, paid: fee.paid, balance: fee.billed - fee.paid, next_due: nextDue || null },
-    attendance: { ...attendance, percentage: counted ? Math.round(((attendance.present + attendance.late) / counted) * 100) : null },
-    leaves, open_complaints: complaints.n, todays_menu: menu.rows,
-  };
+  const leaves = await collection('leaves').find({ student_id: sid }).toArray();
+  const menu = await collection('mess_menu').find({ day_of_week: ((new Date(`${today()}T00:00:00Z`).getUTCDay() + 6) % 7) + 1 }).toArray();
+  menu.sort((a, b) => MEAL_TYPES.indexOf(a.meal_type) - MEAL_TYPES.indexOf(b.meal_type));
+  return { allocation, fees: { billed, paid, balance: billed - paid, next_due }, attendance: { ...attendance, percentage: counted ? Math.round(((attendance.present + attendance.late) / counted) * 100) : null }, leaves: { pending: leaves.filter((l) => l.status === 'pending').length, upcoming: leaves.filter((l) => l.status === 'approved' && l.to_date >= today()).length }, open_complaints: await count('complaints', { student_id: sid, status: { $nin: ['resolved', 'closed'] } }), todays_menu: menu.map(({ meal_type, items }) => ({ meal_type, items })) };
 }
-
 async function maintenanceStats(user) {
-  const [counts, tasks] = await Promise.all([
-    one(`SELECT COUNT(*) FILTER (WHERE status = 'assigned') AS assigned,
-                COUNT(*) FILTER (WHERE status = 'in_progress') AS in_progress,
-                COUNT(*) FILTER (WHERE status = 'resolved' AND resolved_at >= date_trunc('month', CURRENT_DATE::timestamp)) AS resolved_this_month,
-                COUNT(*) FILTER (WHERE status IN ('assigned', 'in_progress') AND priority = 'high') AS high_priority
-           FROM complaints WHERE assigned_to = $1`, [user.id]),
-    query(`${RECENT_COMPLAINTS} WHERE c.assigned_to = $1 AND c.status IN ('assigned', 'in_progress')
-           ORDER BY CASE c.priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, c.created_at LIMIT 8`, [user.id]),
-  ]);
-  return { counts, tasks: tasks.rows };
+  const rows = await collection('complaints').find({ assigned_to: user.id }).toArray(); const month = today().slice(0, 7);
+  const counts = { assigned: rows.filter((c) => c.status === 'assigned').length, in_progress: rows.filter((c) => c.status === 'in_progress').length, resolved_this_month: rows.filter((c) => c.status === 'resolved' && String(c.resolved_at).slice(0, 7) === month).length, high_priority: rows.filter((c) => ['assigned', 'in_progress'].includes(c.status) && c.priority === 'high').length };
+  return { counts, tasks: await complaintRows({ assigned_to: user.id, status: { $in: ['assigned', 'in_progress'] } }, 8) };
 }
-
 router.get('/', asyncHandler(async (req, res) => {
   const handlers = { admin: adminStats, warden: wardenStats, student: studentStats, maintenance: maintenanceStats };
   res.json(await handlers[req.user.role](req.user));
 }));
-
 module.exports = router;

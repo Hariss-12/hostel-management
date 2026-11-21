@@ -15,19 +15,20 @@ export default function Login() {
   const { login } = useAuth();
   const navigate = useNavigate();
   const [role, setRole] = useState('admin');
-  const [email, setEmail] = useState('');
+  const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState('');
+  const supportsId = role !== 'student';
 
   const submit = async (event) => {
     event.preventDefault();
     setFormError('');
-    if (!email.trim() || !password) return setFormError('Enter your email and password.');
+    if (!identifier.trim() || !password) return setFormError('Enter your ID or email and password.');
     setSubmitting(true);
     try {
-      await login(email.trim(), password, role);
+      await login(identifier.trim(), password, role);
       navigate('/', { replace: true });
     } catch (error) {
       setFormError(errorMessage(error));
@@ -58,7 +59,7 @@ export default function Login() {
             {roles.map(({ id, label, Icon }) => <button type="button" key={id} className={`role-option ${role === id ? 'selected' : ''}`} onClick={() => { setRole(id); setFormError(''); }} aria-pressed={role === id}><Icon size={19}/><span>{label}</span></button>)}
           </div>
           {formError && <div className="auth-error" role="alert">{formError}</div>}
-          <label className="auth-field"><span>Email address</span><input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="username" required /></label>
+          <label className="auth-field"><span>{supportsId ? 'ID or email' : 'Email address'}</span><input type="text" value={identifier} onChange={e => setIdentifier(e.target.value)} placeholder={supportsId ? 'ID or email' : 'you@example.com'} autoComplete="username" required /></label>
           <label className="auth-field"><span>Password</span><div className="auth-password-wrap"><input type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} placeholder="Enter your password" autoComplete="current-password" required/><button type="button" className="auth-eye" onClick={() => setShowPassword(v => !v)} aria-label={showPassword ? 'Hide password' : 'Show password'}>{showPassword ? <EyeOff size={18}/> : <Eye size={18}/>}</button></div></label>
           <button className="auth-submit" type="submit" disabled={submitting}><LogIn size={18}/>{submitting ? 'Signing in…' : `Sign in as ${roles.find(r => r.id === role).label}`}</button>
           <p className="auth-switch">New student? <Link to="/signup">Create a student account</Link></p>

@@ -12,6 +12,5 @@ const isDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && 
 const isMonth = (s) => typeof s === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(s);
 
 const MEAL_TYPES = ['breakfast', 'lunch', 'snacks', 'dinner'];
-const MEAL_ORDER_SQL = `CASE meal_type WHEN 'breakfast' THEN 1 WHEN 'lunch' THEN 2 WHEN 'snacks' THEN 3 ELSE 4 END`;
 
-module.exports = { today, optInt, isDate, isMonth, MEAL_TYPES, MEAL_ORDER_SQL };
+module.exports = { today, optInt, isDate, isMonth, MEAL_TYPES };
