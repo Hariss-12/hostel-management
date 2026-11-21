@@ -1,5 +1,4 @@
-/**
- * Seeds local showcase records. Requires DEMO_PASSWORD in the environment.
+/* * Seeds local showcase records. Requires DEMO_PASSWORD in the environment.
  * Never prints or stores the password outside its bcrypt hash.
  */
 require('dotenv').config();
