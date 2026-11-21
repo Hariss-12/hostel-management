@@ -60,7 +60,9 @@ Roles: admin, warden, student, and maintenance. Modules include staff and studen
 
 ## Deployment
 
-The Render blueprint deploys the API and frontend. Configure `MONGODB_URI` and `MONGODB_DB` in the backend service's private environment settings, and set `CLIENT_URL` to the frontend URL. MongoDB Atlas remains an external managed dependency; `render.yaml` does not provision a PostgreSQL database or include database credentials. Initialize indexes and create the first admin by running the documented backend scripts in an environment configured with the private connection variables.
+The Render blueprint deploys the API and frontend. Configure `MONGODB_URI` and `MONGODB_DB` in the backend service's private environment settings, and set `CLIENT_URL` to the frontend origin. MongoDB Atlas remains an external managed dependency; `render.yaml` does not provision a database or include database credentials. Initialize indexes and create the first admin by running the documented backend scripts in an environment configured with the private connection variables.
+
+The GitHub Actions workflow also deploys the frontend to GitHub Pages at `https://hariss-12.github.io/hostel-management/`. In repository **Settings → Pages**, choose **GitHub Actions** as the build and deployment source. The workflow builds the app with the correct project path and Render API URL; `CLIENT_URL` on the Render backend must allow `https://hariss-12.github.io` for browser API requests.
 
 ## Notes
 
