@@ -26,6 +26,8 @@ Set these values in `backend/.env` using your own MongoDB connection details. Ne
 | `JWT_SECRET` | Long random signing secret |
 | `CLIENT_URL` | Allowed frontend origin(s), comma separated |
 
+The backend loads `backend/.env` regardless of the directory used to start it. In hosted deployments, configure `MONGODB_URI` as the complete Atlas connection URI in the backend service's private environment settings; do not include surrounding quotes or the example placeholders.
+
 Use the provided URI placeholder in `.env.example` as a format example only. Create the empty Atlas database named `hostel_management` (or use the default) and make sure its network access list and database user permissions are configured. The backend creates its collections on first write and ensures indexes during startup; no schema import or manual initialization is required. `npm run init-db` can be used to connect and create/check indexes.
 
 Indexes include unique normalized user email, role + username, student roll number, room number per hostel, bed number per room, active allocation per bed/student, attendance per student/date, weekly meal entries, and meal opt-outs. Numeric API IDs are generated with an atomic MongoDB counter. Multi-document operations use MongoDB transactions; use an Atlas cluster or a transaction-capable MongoDB replica set.

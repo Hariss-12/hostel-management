@@ -23,9 +23,9 @@ services:
         generateValue: true
       - key: JWT_EXPIRES_IN
         value: 8h
-      # Allow the local dev server and the GitHub Pages frontend.
+      # Allow the Render and GitHub Pages frontends.
       - key: CLIENT_URL
-        value: http://localhost:5173,https://hariss-12.github.io
+        value: https://hms-frontend.onrender.com,https://hariss-12.github.io
 
   # ---------- Frontend (static site) ----------
   - type: web

@@ -1,4 +1,5 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 const app = require('./app');
 const { connect } = require('./config/db');
 
@@ -16,6 +17,7 @@ connect().then((database) => {
   });
 }).catch((err) => {
   console.error(`MongoDB startup failed: ${err.message}`);
-  console.error('Check MONGODB_URI and MONGODB_DB in backend/.env.');
+  console.error('Set MONGODB_URI to the complete mongodb:// or mongodb+srv:// URI in backend/.env or the backend service environment. Do not include surrounding quotes or placeholder values.');
+  console.error('Check MONGODB_DB in the same environment.');
   process.exit(1);
 });

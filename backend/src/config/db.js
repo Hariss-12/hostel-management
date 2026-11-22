@@ -1,5 +1,6 @@
 
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
 
 const { MongoClient } = require('mongodb');
 
@@ -35,22 +36,21 @@ async function connect() {
 
   if (connectingPromise) return connectingPromise;
 
-  connectingPromise = (async () => {
-    const uri = process.env.MONGODB_URI?.trim();
-    const dbName = process.env.MONGODB_DB?.trim() || 'hostel_management';
-
-    if (!uri) {
-      throw new Error('MONGODB_URI is missing');
-    }
-
-    // Validate MongoDB URI format
-    if (!/^mongodb(\+srv)?:\/\//i.test(uri)) {
-      throw new Error(
-        'Invalid MONGODB_URI. It must start with mongodb:// or mongodb+srv://'
-      );
-    }
-
+  connectingPromise = Promise.resolve().then(async () => {
     try {
+      const uri = process.env.MONGODB_URI?.trim();
+      const dbName = process.env.MONGODB_DB?.trim() || 'hostel_management';
+
+      if (!uri) {
+        throw new Error('MONGODB_URI is missing');
+      }
+
+      if (!/^mongodb(\+srv)?:\/\//i.test(uri)) {
+        throw new Error(
+          'Invalid MONGODB_URI. It must start with mongodb:// or mongodb+srv://'
+        );
+      }
+
       client = new MongoClient(uri, {
         serverSelectionTimeoutMS: 15000,
         connectTimeoutMS: 15000,
@@ -90,7 +90,7 @@ async function connect() {
     } finally {
       connectingPromise = undefined;
     }
-  })();
+  });
 
   return connectingPromise;
 }
